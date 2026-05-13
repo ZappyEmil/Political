@@ -278,6 +278,32 @@ def articles_json(articles):
     return json.dumps(articles, ensure_ascii=False, indent=2)
 
 
+def fallback_summary(articles):
+    top = articles[:5]
+    lines = [
+        "**Dagens mønster**",
+        "Kildene peker på flere parallelle politiske spor, men grunnlaget er for tynt til bastante konklusjoner.",
+        "",
+        "**Toppsaker**",
+    ]
+
+    for index, article in enumerate(top, start=1):
+        link = article["link"] or ""
+        title = article["title"] or "Uten tittel"
+        published = article["published"] or "Ukjent tidspunkt"
+        source = article["source"] or article["feed"] or "Ukjent kilde"
+        linked_title = f"[{title}]({link})" if link else title
+        lines.append(f"{index}. **{linked_title}**")
+        lines.append(f"   Kort: {source}, publisert {published}.")
+        lines.append("   Konfliktlinje: Trenger mer detaljgrunnlag fra sakstekst før hard tolkning.")
+        lines.append("   Følg med på: Om saken får konkret oppfølging i partier, regjering eller Storting.")
+
+    lines.append("")
+    lines.append("**Kildemerknad**")
+    lines.append("Automatisk reserveoppsummering fordi modellsvaret var tomt eller ugyldig.")
+    return "\n".join(lines)
+
+
 def summarize(articles, openrouter_api_key):
     prompt = f"""
 Du skriver en norsk politisk morgenbriefing for en leser med mastergrad i politikk.
@@ -335,15 +361,25 @@ JSON-artikler:
         raise RuntimeError(f"OpenRouter API error: {response_data['error']}")
 
     try:
-        return response_data["choices"][0]["message"]["content"]
+        content = response_data["choices"][0]["message"].get("content")
     except (KeyError, IndexError) as exc:
         raise RuntimeError(f"Unexpected OpenRouter response: {response_data}") from exc
 
+    clean_content = clean_text(content)
+    if not clean_content:
+        print("Warning: model returned empty content, using fallback summary.")
+        return fallback_summary(articles)
+
+    return clean_content
+
 
 def truncate_text(text, max_length):
-    if len(text) <= max_length:
-        return text
-    return text[: max_length - 3].rstrip() + "..."
+    if text is None:
+        return ""
+    value = str(text)
+    if len(value) <= max_length:
+        return value
+    return value[: max_length - 3].rstrip() + "..."
 
 
 def source_links(articles):
