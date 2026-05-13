@@ -13,7 +13,7 @@ Automated daily briefings on Norwegian political developments, delivered to Disc
 ## Features
 
 - Fetches open Norwegian news RSS feeds
-- Prioritizes politics-related items before summarizing
-- Summarizes developments using AI
-- Posts to Discord webhook
+- Strictly filters for politics-related items before summarizing
+- Summarizes up to five political developments with more context
+- Posts the briefing as a Discord embed with source links
 - Runs automatically every day
