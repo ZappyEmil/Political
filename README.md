@@ -21,7 +21,7 @@ Automated daily briefings on Norwegian political developments, delivered to Disc
 - Generates short rule-based observations from counts and source patterns
 - Posts a deterministic Discord embed with clickable links for each item
 - Prints debugging details for fetched counts, exclusions, reasons, and final scores
-- Avoids LLM-generated prose to keep the briefing grounded and non-hallucinated
+- Keeps the briefing grounded in RSS metadata and deterministic rules
 
 ## Source Mix
 
