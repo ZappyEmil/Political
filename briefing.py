@@ -11,24 +11,39 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 FEEDS = [
     {
-        "name": "NRK Toppsaker",
-        "url": "https://www.nrk.no/toppsaker.rss",
-        "politics_only": False,
+        "name": "Google News: norsk politikk",
+        "url": "https://news.google.com/rss/search?q=norsk%20politikk&hl=no&gl=NO&ceid=NO:no",
+        "politics_feed": True,
     },
     {
-        "name": "NRK Siste nytt",
-        "url": "https://www.nrk.no/nyheter/siste.rss",
-        "politics_only": False,
+        "name": "Google News: Stortinget og regjeringen",
+        "url": "https://news.google.com/rss/search?q=Stortinget%20OR%20regjeringen&hl=no&gl=NO&ceid=NO:no",
+        "politics_feed": True,
     },
     {
         "name": "E24 Makro og politikk",
         "url": "https://e24.no/rss2/?seksjon=makro-og-politikk",
-        "politics_only": True,
+        "politics_feed": True,
+    },
+    {
+        "name": "Khrono",
+        "url": "https://www.khrono.no/?lab_viewport=rss",
+        "politics_feed": False,
+    },
+    {
+        "name": "NRK Toppsaker",
+        "url": "https://www.nrk.no/toppsaker.rss",
+        "politics_feed": False,
+    },
+    {
+        "name": "NRK Siste nytt",
+        "url": "https://www.nrk.no/nyheter/siste.rss",
+        "politics_feed": False,
     },
     {
         "name": "Nettavisen Nyheter",
         "url": "https://www.nettavisen.no/service/rich-rss?tag=nyheter",
-        "politics_only": False,
+        "politics_feed": False,
     },
 ]
 
@@ -65,8 +80,9 @@ POLITICAL_KEYWORDS = [
     "valg",
 ]
 
-MAX_ARTICLES = 12
-MAX_PER_SOURCE = 8
+MAX_ARTICLES = 14
+MAX_PER_SOURCE = 3
+MAX_CANDIDATES_PER_SOURCE = 25
 
 
 def require_env(name, value):
@@ -142,35 +158,42 @@ def is_political(entry):
     return any(keyword in text for keyword in POLITICAL_KEYWORDS)
 
 
+def entry_source_name(entry, fallback):
+    source = getattr(entry, "source", None)
+    if source and getattr(source, "title", None):
+        return source.title
+    return fallback
+
+
 def collect_articles():
     articles = []
     seen = set()
 
     for feed_config in FEEDS:
-        source_name = feed_config["name"]
+        feed_name = feed_config["name"]
 
         try:
             feed = fetch_feed(feed_config)
         except requests.RequestException as exc:
-            print(f"Warning: could not fetch {source_name}: {exc}")
+            print(f"Warning: could not fetch {feed_name}: {exc}")
             continue
 
         if feed.bozo:
-            print(f"Warning: {source_name} had malformed content: {feed.bozo_exception}")
+            print(f"Warning: {feed_name} had malformed content: {feed.bozo_exception}")
 
         if not feed.entries:
-            print(f"Warning: no entries found in {source_name}")
+            print(f"Warning: no entries found in {feed_name}")
             continue
 
         added_from_source = 0
         skipped_non_political = 0
-        for entry in feed.entries[:20]:
+        for entry in feed.entries[:MAX_CANDIDATES_PER_SOURCE]:
             title = getattr(entry, "title", "Untitled")
             link = getattr(entry, "link", "")
             unique_key = link or title
-            political_match = is_political(entry)
+            political_match = feed_config.get("politics_feed") or is_political(entry)
 
-            if not feed_config.get("politics_only") and not political_match:
+            if not political_match:
                 skipped_non_political += 1
                 continue
 
@@ -178,60 +201,68 @@ def collect_articles():
                 continue
 
             seen.add(unique_key)
-            article = {
-                "source": source_name,
-                "title": title,
-                "link": link,
-            }
-            articles.append(article)
+            articles.append(
+                {
+                    "feed": feed_name,
+                    "source": entry_source_name(entry, feed_name),
+                    "title": title,
+                    "link": link,
+                }
+            )
             added_from_source += 1
 
-            if added_from_source >= MAX_PER_SOURCE or len(articles) >= MAX_ARTICLES:
+            if added_from_source >= MAX_PER_SOURCE:
                 break
 
         print(
-            f"Collected {added_from_source} political articles from {source_name} "
+            f"Collected {added_from_source} political articles from {feed_name} "
             f"and skipped {skipped_non_political} non-political articles."
         )
 
-        if len(articles) >= MAX_ARTICLES:
-            break
-
-    return articles
+    return articles[:MAX_ARTICLES]
 
 
 def format_articles_for_prompt(articles):
     lines = []
     for index, article in enumerate(articles, start=1):
         link = article["link"] or "No link"
-        lines.append(f"{index}. [{article['source']}] {article['title']}\n   {link}")
+        lines.append(
+            f"{index}. [{article['source']} via {article['feed']}] {article['title']}\n"
+            f"   {link}"
+        )
     return "\n".join(lines)
 
 
 def summarize(articles, openrouter_api_key):
     news_text = format_articles_for_prompt(articles)
     prompt = f"""
-Skriv en norsk politisk briefing for Discord basert kun på sakene under.
+Skriv en norsk politisk morgenbriefing for en leser med mastergrad i politikk.
 
 Strenge regler:
-- Ta bare med politikk, offentlig styring, partier, Storting/regjering, kommunepolitikk, lovverk, skatt, budsjett, velferd, justis, energi eller utenriks/sikkerhetspolitikk.
-- Ikke ta med sport, kjendiser, forbrukerstoff, ulykker eller generell krim med mindre saken har tydelig politisk konsekvens.
+- Ta bare med saker med reell politisk relevans: makt, institusjoner, partier, styring, budsjett, lovverk, forvaltning, velferd, justis, energi, sikkerhetspolitikk eller utenrikspolitikk.
+- Ikke forklar banale ting som at kommuner har ansvar, at Stortinget vedtar lover, eller at budsjett påvirker prioriteringer.
+- Ikke bruk skoleaktige formuleringer som "dette viser hvordan" eller generiske setninger uten analytisk verdi.
 - Ikke bruk Markdown-tabeller.
-- Skriv litt mer utfyllende enn en notis, men hold det lett å skanne.
 - Velg maks 5 saker.
-- For hver sak: tittel, kort forklaring, hvorfor det er politisk viktig.
+- Skriv substansielt, men stramt. Hver sak kan ha 3-5 setninger.
+- Vær eksplisitt om konfliktlinje, aktører, maktmidler, budsjettmessig/institusjonell betydning og hva som bør følges videre.
+- Ikke dikte detaljer som ikke finnes i sakstitlene. Marker usikkerhet nøkternt hvis grunnlaget er tynt.
 
 Saker:
 {news_text}
 
 Format:
+**Dagens mønster**
+2-3 analytiske setninger om den samlede politiske tendensen.
+
 **Toppsaker**
 1. **Tittel**
-   Hva skjedde: ...
-   Politisk betydning: ...
+   Kort: ...
+   Konfliktlinje: ...
+   Følg med på: ...
 
-**Kort vurdering**
-2-3 setninger om hva dagens saker samlet peker mot.
+**Kilder vurdert**
+Kort setning om kildemiks og eventuelle hull i materialet.
 """
 
     response = requests.post(
@@ -245,6 +276,8 @@ Format:
             "messages": [
                 {"role": "user", "content": prompt},
             ],
+            "temperature": 0.25,
+            "max_tokens": 1400,
         },
         timeout=60,
     )
@@ -268,16 +301,17 @@ def truncate_text(text, max_length):
 
 def source_links(articles):
     links = []
-    for article in articles[:5]:
+    for article in articles[:10]:
         if article["link"]:
-            links.append(f"[{article['source']}]({article['link']})")
-    return " | ".join(links) or "Ingen lenker tilgjengelig"
+            title = truncate_text(article["title"], 70)
+            links.append(f"[{title}]({article['link']})")
+    return "\n".join(links) or "Ingen lenker tilgjengelig"
 
 
 def post_to_discord(summary, articles, webhook_url):
     embed = {
         "title": "Morning Political Briefing",
-        "description": truncate_text(summary, 3800),
+        "description": truncate_text(summary, 3900),
         "color": 3447003,
         "fields": [
             {
@@ -287,7 +321,7 @@ def post_to_discord(summary, articles, webhook_url):
             }
         ],
         "footer": {
-            "text": f"{len(articles)} politiske saker vurdert"
+            "text": f"{len(articles)} politiske saker vurdert fra {len(FEEDS)} feeds"
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
