@@ -1,5 +1,6 @@
 import os
 import sys
+from urllib.parse import urlparse
 
 import feedparser
 import requests
@@ -54,8 +55,33 @@ POLITICAL_KEYWORDS = [
 
 
 def require_env(name, value):
-    if not value:
+    if not value or not value.strip():
         print(f"Missing required environment variable: {name}")
+        sys.exit(1)
+
+
+def get_required_env(name):
+    value = os.getenv(name)
+    require_env(name, value)
+    return value.strip()
+
+
+def require_discord_webhook_url(value):
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        print(
+            "Invalid DISCORD_WEBHOOK_URL: expected a full Discord webhook URL "
+            "starting with https://discord.com/api/webhooks/"
+        )
+        sys.exit(1)
+
+    if parsed.netloc not in ("discord.com", "discordapp.com") or not parsed.path.startswith(
+        "/api/webhooks/"
+    ):
+        print(
+            "Invalid DISCORD_WEBHOOK_URL: the secret should look like "
+            "https://discord.com/api/webhooks/<webhook_id>/<token>"
+        )
         sys.exit(1)
 
 
@@ -145,7 +171,7 @@ def collect_articles():
     return articles
 
 
-def summarize(news_text):
+def summarize(news_text, openrouter_api_key):
     prompt = f"""
 Summarize these Norwegian news items as a short Norwegian political briefing.
 
@@ -165,7 +191,7 @@ Keep concise.
     response = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Authorization": f"Bearer {openrouter_api_key}",
             "Content-Type": "application/json",
         },
         json={
@@ -188,7 +214,7 @@ Keep concise.
         raise RuntimeError(f"Unexpected OpenRouter response: {response_data}") from exc
 
 
-def post_to_discord(summary):
+def post_to_discord(summary, webhook_url):
     content = f"Morning Political Briefing\n\n{summary}"
 
     # Discord messages have a 2000 character limit.
@@ -196,7 +222,7 @@ def post_to_discord(summary):
         content = content[:1897] + "..."
 
     response = requests.post(
-        DISCORD_WEBHOOK_URL,
+        webhook_url,
         json={"content": content},
         timeout=30,
     )
@@ -204,8 +230,9 @@ def post_to_discord(summary):
 
 
 def main():
-    require_env("OPENROUTER_API_KEY", OPENROUTER_API_KEY)
-    require_env("DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL)
+    openrouter_api_key = get_required_env("OPENROUTER_API_KEY")
+    discord_webhook_url = get_required_env("DISCORD_WEBHOOK_URL")
+    require_discord_webhook_url(discord_webhook_url)
 
     articles = collect_articles()
     if not articles:
@@ -213,8 +240,8 @@ def main():
         sys.exit(1)
 
     news_text = "\n".join(articles)
-    summary = summarize(news_text)
-    post_to_discord(summary)
+    summary = summarize(news_text, openrouter_api_key)
+    post_to_discord(summary, discord_webhook_url)
     print("Briefing posted to Discord.")
 
 
