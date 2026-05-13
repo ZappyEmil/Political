@@ -1,5 +1,4 @@
 import os
-import re
 import sys
 
 import feedparser
@@ -13,15 +12,25 @@ FEEDS = [
     "https://www.stortinget.no/no/Stottemeny/rss/",
 ]
 
-INVALID_XML_CHARS = re.compile(
-    "[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]"
-)
-
 
 def require_env(name, value):
     if not value:
         print(f"Missing required environment variable: {name}")
         sys.exit(1)
+
+
+def is_valid_xml_char(char):
+    codepoint = ord(char)
+    return (
+        codepoint in (0x09, 0x0A, 0x0D)
+        or 0x20 <= codepoint <= 0xD7FF
+        or 0xE000 <= codepoint <= 0xFFFD
+        or 0x10000 <= codepoint <= 0x10FFFF
+    )
+
+
+def clean_xml_text(text):
+    return "".join(char for char in text if is_valid_xml_char(char))
 
 
 def fetch_feed(feed_url):
@@ -32,7 +41,7 @@ def fetch_feed(feed_url):
     )
     response.raise_for_status()
 
-    cleaned_text = INVALID_XML_CHARS.sub("", response.text)
+    cleaned_text = clean_xml_text(response.text)
     return feedparser.parse(cleaned_text)
 
 
