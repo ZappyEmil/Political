@@ -1,9 +1,11 @@
+import html
 import os
 import re
 import sys
 from collections import Counter
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
 import feedparser
@@ -12,16 +14,6 @@ import requests
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 FEEDS = [
-    {
-        "name": "Google News: norsk politikk",
-        "url": "https://news.google.com/rss/search?q=norsk%20politikk&hl=no&gl=NO&ceid=NO:no",
-        "politics_feed": True,
-    },
-    {
-        "name": "Google News: Stortinget og regjeringen",
-        "url": "https://news.google.com/rss/search?q=Stortinget%20OR%20regjeringen&hl=no&gl=NO&ceid=NO:no",
-        "politics_feed": True,
-    },
     {
         "name": "E24 Makro og politikk",
         "url": "https://e24.no/rss2/?seksjon=makro-og-politikk",
@@ -47,6 +39,16 @@ FEEDS = [
         "url": "https://www.nettavisen.no/service/rich-rss?tag=nyheter",
         "politics_feed": False,
     },
+    {
+        "name": "Google News: norsk politikk",
+        "url": "https://news.google.com/rss/search?q=norsk%20politikk&hl=no&gl=NO&ceid=NO:no",
+        "politics_feed": True,
+    },
+    {
+        "name": "Google News: Stortinget og regjeringen",
+        "url": "https://news.google.com/rss/search?q=Stortinget%20OR%20regjeringen&hl=no&gl=NO&ceid=NO:no",
+        "politics_feed": True,
+    },
 ]
 
 TOPIC_KEYWORDS = {
@@ -62,11 +64,13 @@ TOPIC_KEYWORDS = {
     ],
     "Partipolitikk": [
         "arbeiderpartiet",
+        "fremskrittspartiet",
         "frp",
         "hoyre",
         "høyre",
         "krf",
         "partiet",
+        "partileder",
         "politiker",
         "politikk",
         "rodt",
@@ -85,6 +89,7 @@ TOPIC_KEYWORDS = {
         "olje",
         "penger",
         "rente",
+        "revidert nasjonalbudsjett",
         "skatt",
         "statsbudsjett",
         "økonomi",
@@ -125,12 +130,13 @@ TOPIC_KEYWORDS = {
         "utenriks",
     ],
     "Utdanning/forskning": [
-        "forskning",
+        "forskningspolitikk",
+        "forskningsrådet",
         "høyskole",
-        "khrono",
-        "student",
+        "kunnskapsdepartementet",
+        "studentbolig",
         "universitet",
-        "utdanning",
+        "utdanningspolitikk",
     ],
 }
 
@@ -139,6 +145,7 @@ MAX_PER_SOURCE = 3
 MAX_CANDIDATES_PER_SOURCE = 25
 TOP_ITEMS = 5
 SIMILAR_TITLE_THRESHOLD = 0.86
+MIN_DIRECT_FEED_TOPICS = 1
 
 
 def require_env(name, value):
@@ -187,11 +194,17 @@ def clean_xml_text(text):
 
 
 def clean_text(value, max_length=None):
-    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    text = html.unescape(str(value or ""))
+    text = text.replace("&nbsp;", " ")
+    text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     if max_length and len(text) > max_length:
         return text[: max_length - 3].rstrip() + "..."
     return text
+
+
+def clean_google_title(title):
+    return re.sub(r"\s+-\s+[^-]+$", "", title).strip()
 
 
 def fetch_feed(feed):
@@ -217,16 +230,17 @@ def entry_text(entry):
     ).lower()
 
 
+def contains_keyword(text, keyword):
+    pattern = rf"(?<![\wæøå]){re.escape(keyword.lower())}(?![\wæøå])"
+    return re.search(pattern, text, flags=re.IGNORECASE) is not None
+
+
 def topics_for_text(text):
     topics = []
     for topic, keywords in TOPIC_KEYWORDS.items():
-        if any(keyword in text for keyword in keywords):
+        if any(contains_keyword(text, keyword) for keyword in keywords):
             topics.append(topic)
     return topics
-
-
-def is_political(entry):
-    return bool(topics_for_text(entry_text(entry)))
 
 
 def entry_source_name(entry, fallback):
@@ -236,15 +250,30 @@ def entry_source_name(entry, fallback):
     return fallback
 
 
-def entry_summary(entry):
+def entry_summary(entry, title):
     summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
-    return clean_text(summary, 320)
+    summary = clean_text(summary, 320)
+    normalized_summary = normalized_title(summary)
+    normalized_entry_title = normalized_title(title)
+    if normalized_summary == normalized_entry_title:
+        return ""
+    return summary
 
 
 def entry_published(entry):
     for attribute in ("published", "updated", "created"):
         value = getattr(entry, attribute, "")
-        if value:
+        if not value:
+            continue
+        if isinstance(value, str) and value.isdigit():
+            parsed = datetime.fromtimestamp(int(value), tz=timezone.utc)
+            return parsed.strftime("%Y-%m-%d %H:%M UTC")
+        try:
+            parsed = parsedate_to_datetime(str(value))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        except (TypeError, ValueError, OverflowError):
             return clean_text(value, 120)
     return ""
 
@@ -276,21 +305,24 @@ def is_duplicate(article, seen_links, seen_titles):
 
 
 def relevance_score(article):
-    score = len(article["topics"]) * 2
+    score = len(article["topics"]) * 3
     title = article["title"].lower()
     summary = article["summary"].lower()
 
     for keyword in ("regjering", "storting", "budsjett", "lov", "minister", "sikkerhet"):
-        if keyword in title:
-            score += 2
-        elif keyword in summary:
+        if contains_keyword(title, keyword):
+            score += 3
+        elif contains_keyword(summary, keyword):
             score += 1
 
     if article["summary"]:
-        score += 1
+        score += 2
 
     if article["feed"].startswith("Google News"):
-        score -= 1
+        score -= 2
+
+    if "Utdanning/forskning" in article["topics"] and len(article["topics"]) == 1:
+        score -= 2
 
     return score
 
@@ -319,22 +351,30 @@ def collect_articles():
         added_from_source = 0
         skipped_non_political = 0
         skipped_duplicates = 0
+        skipped_low_quality = 0
         for entry in feed.entries[:MAX_CANDIDATES_PER_SOURCE]:
+            raw_title = clean_text(getattr(entry, "title", "Untitled"), 180)
+            title = clean_google_title(raw_title) if feed_name.startswith("Google News") else raw_title
             text = entry_text(entry)
             topics = topics_for_text(text)
-            political_match = feed_config.get("politics_feed") or bool(topics)
-            if not political_match:
+
+            if not topics:
                 skipped_non_political += 1
+                continue
+
+            summary = entry_summary(entry, title)
+            if not feed_config.get("politics_feed") and not summary and len(topics) <= MIN_DIRECT_FEED_TOPICS:
+                skipped_low_quality += 1
                 continue
 
             article = {
                 "feed": feed_name,
                 "source": entry_source_name(entry, feed_name),
                 "published": entry_published(entry),
-                "title": clean_text(getattr(entry, "title", "Untitled"), 180),
-                "summary": entry_summary(entry),
+                "title": title,
+                "summary": summary,
                 "link": clean_text(getattr(entry, "link", ""), 500),
-                "topics": topics or ["Politikk"],
+                "topics": topics,
             }
             article["score"] = relevance_score(article)
 
@@ -350,8 +390,8 @@ def collect_articles():
 
         print(
             f"Collected {added_from_source} political articles from {feed_name}; "
-            f"skipped {skipped_non_political} non-political and "
-            f"{skipped_duplicates} duplicate articles."
+            f"skipped {skipped_non_political} non-political, "
+            f"{skipped_duplicates} duplicate, and {skipped_low_quality} low-quality articles."
         )
 
     return sorted(articles, key=lambda article: article["score"], reverse=True)[:MAX_ARTICLES]
@@ -402,9 +442,9 @@ def briefing_pattern(articles):
 
     source_text = ", ".join(top_sources) if top_sources else "RSS-kildene"
     return (
-        f"Tyngdepunktet i materialet ligger i {topic_text}. "
-        f"Kildebildet er dominert av {source_text}, så dette bør leses som en rask morgenradar, ikke en full dagsanalyse. "
-        "Briefingen bruker bare RSS-data: tittel, kilde, dato, sammendrag og lenke."
+        f"Tyngdepunktet ligger i {topic_text}. "
+        f"Kildebildet heller mot {source_text}; les dette som morgenradar, ikke fasit. "
+        "Kun RSS-data brukes: tittel, kilde, dato, sammendrag og lenke."
     )
 
 
