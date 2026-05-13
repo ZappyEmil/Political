@@ -8,8 +8,48 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 FEEDS = [
-    "https://www.regjeringen.no/no/aktuelt/rss/id1330/",
-    "https://www.stortinget.no/no/Stottemeny/rss/",
+    {
+        "name": "NRK Toppsaker",
+        "url": "https://www.nrk.no/toppsaker.rss",
+    },
+    {
+        "name": "NRK Siste nytt",
+        "url": "https://www.nrk.no/nyheter/siste.rss",
+    },
+    {
+        "name": "E24 Makro og politikk",
+        "url": "https://e24.no/rss2/?seksjon=makro-og-politikk",
+    },
+    {
+        "name": "Nettavisen Nyheter",
+        "url": "https://www.nettavisen.no/service/rich-rss?tag=nyheter",
+    },
+]
+
+POLITICAL_KEYWORDS = [
+    "ap",
+    "arbeiderpartiet",
+    "erna",
+    "eos",
+    "eøs",
+    "frp",
+    "hoyre",
+    "høyre",
+    "kommune",
+    "minister",
+    "parti",
+    "politikk",
+    "regjering",
+    "rodt",
+    "rødt",
+    "sp",
+    "stoltenberg",
+    "storting",
+    "store",
+    "støre",
+    "sv",
+    "valg",
+    "venstre",
 ]
 
 
@@ -33,9 +73,9 @@ def clean_xml_text(text):
     return "".join(char for char in text if is_valid_xml_char(char))
 
 
-def fetch_feed(feed_url):
+def fetch_feed(feed):
     response = requests.get(
-        feed_url,
+        feed["url"],
         headers={"User-Agent": "PoliticalBriefingBot/1.0"},
         timeout=30,
     )
@@ -45,37 +85,71 @@ def fetch_feed(feed_url):
     return feedparser.parse(cleaned_text)
 
 
+def is_political(entry):
+    text = " ".join(
+        str(value)
+        for value in [
+            getattr(entry, "title", ""),
+            getattr(entry, "summary", ""),
+            getattr(entry, "description", ""),
+        ]
+    ).lower()
+    return any(keyword in text for keyword in POLITICAL_KEYWORDS)
+
+
 def collect_articles():
     articles = []
+    seen = set()
 
-    for feed_url in FEEDS:
+    for feed_config in FEEDS:
+        source_name = feed_config["name"]
+
         try:
-            feed = fetch_feed(feed_url)
+            feed = fetch_feed(feed_config)
         except requests.RequestException as exc:
-            print(f"Warning: could not fetch feed {feed_url}: {exc}")
+            print(f"Warning: could not fetch {source_name}: {exc}")
             continue
 
         if feed.bozo:
-            print(f"Warning: feed had malformed content {feed_url}: {feed.bozo_exception}")
+            print(f"Warning: {source_name} had malformed content: {feed.bozo_exception}")
 
         if not feed.entries:
-            print(f"Warning: no entries found in feed {feed_url}")
+            print(f"Warning: no entries found in {source_name}")
             continue
 
-        for entry in feed.entries[:5]:
+        added_from_source = 0
+        for entry in feed.entries[:15]:
             title = getattr(entry, "title", "Untitled")
             link = getattr(entry, "link", "")
+            unique_key = link or title
+
+            if unique_key in seen:
+                continue
+
+            seen.add(unique_key)
+            prefix = "*" if is_political(entry) else "-"
             if link:
-                articles.append(f"- {title}\n  {link}")
+                articles.append(f"{prefix} [{source_name}] {title}\n  {link}")
             else:
-                articles.append(f"- {title}")
+                articles.append(f"{prefix} [{source_name}] {title}")
+            added_from_source += 1
+
+            if len(articles) >= 30:
+                break
+
+        print(f"Collected {added_from_source} articles from {source_name}.")
+
+        if len(articles) >= 30:
+            break
 
     return articles
 
 
 def summarize(news_text):
     prompt = f"""
-Summarize these Norwegian political developments briefly in Norwegian:
+Summarize these Norwegian news items as a short Norwegian political briefing.
+
+Items marked with * matched political keywords. Prioritize those items, but include other major national developments if they matter politically.
 
 {news_text}
 
