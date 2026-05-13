@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 
 import feedparser
@@ -12,6 +13,10 @@ FEEDS = [
     "https://www.stortinget.no/no/Stottemeny/rss/",
 ]
 
+INVALID_XML_CHARS = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]"
+)
+
 
 def require_env(name, value):
     if not value:
@@ -19,14 +24,33 @@ def require_env(name, value):
         sys.exit(1)
 
 
+def fetch_feed(feed_url):
+    response = requests.get(
+        feed_url,
+        headers={"User-Agent": "PoliticalBriefingBot/1.0"},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    cleaned_text = INVALID_XML_CHARS.sub("", response.text)
+    return feedparser.parse(cleaned_text)
+
+
 def collect_articles():
     articles = []
 
     for feed_url in FEEDS:
-        feed = feedparser.parse(feed_url)
+        try:
+            feed = fetch_feed(feed_url)
+        except requests.RequestException as exc:
+            print(f"Warning: could not fetch feed {feed_url}: {exc}")
+            continue
 
         if feed.bozo:
-            print(f"Warning: could not parse feed {feed_url}: {feed.bozo_exception}")
+            print(f"Warning: feed had malformed content {feed_url}: {feed.bozo_exception}")
+
+        if not feed.entries:
+            print(f"Warning: no entries found in feed {feed_url}")
             continue
 
         for entry in feed.entries[:5]:
