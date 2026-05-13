@@ -1,7 +1,7 @@
-import json
 import os
 import re
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from urllib.parse import urlparse
@@ -9,9 +9,7 @@ from urllib.parse import urlparse
 import feedparser
 import requests
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip() or "openrouter/free"
 
 FEEDS = [
     {
@@ -51,42 +49,95 @@ FEEDS = [
     },
 ]
 
-POLITICAL_KEYWORDS = [
-    "arbeiderpartiet",
-    "bystyre",
-    "departement",
-    "eos",
-    "eøs",
-    "finansminister",
-    "frp",
-    "hoyre",
-    "høyre",
-    "kommune",
-    "kommunestyre",
-    "krf",
-    "lovforslag",
-    "minister",
-    "partiet",
-    "politiker",
-    "politikk",
-    "regjering",
-    "regjeringen",
-    "rodt",
-    "rødt",
-    "senterpartiet",
-    "statsbudsjett",
-    "statsminister",
-    "storting",
-    "stortinget",
-    "støre",
-    "sv",
-    "venstre",
-    "valg",
-]
+TOPIC_KEYWORDS = {
+    "Regjering/Storting": [
+        "departement",
+        "lovforslag",
+        "minister",
+        "regjering",
+        "regjeringen",
+        "statsminister",
+        "storting",
+        "stortinget",
+    ],
+    "Partipolitikk": [
+        "arbeiderpartiet",
+        "frp",
+        "hoyre",
+        "høyre",
+        "krf",
+        "partiet",
+        "politiker",
+        "politikk",
+        "rodt",
+        "rødt",
+        "senterpartiet",
+        "støre",
+        "sv",
+        "venstre",
+        "valg",
+    ],
+    "Budsjett/økonomi": [
+        "avgift",
+        "budsjett",
+        "finansminister",
+        "nasjonalbudsjett",
+        "olje",
+        "penger",
+        "rente",
+        "skatt",
+        "statsbudsjett",
+        "økonomi",
+    ],
+    "Kommune/forvaltning": [
+        "barnevern",
+        "bystyre",
+        "fylke",
+        "kommune",
+        "kommunal",
+        "kommunestyre",
+        "nav",
+        "skole",
+        "velferd",
+    ],
+    "Justis/sikkerhet": [
+        "beredskap",
+        "domstol",
+        "etterretning",
+        "forsvar",
+        "helikopter",
+        "justis",
+        "kriminalitet",
+        "politi",
+        "pst",
+        "sikkerhet",
+    ],
+    "Utenriks/EØS": [
+        "eos",
+        "eøs",
+        "eu",
+        "europeisk",
+        "forsvar",
+        "nato",
+        "russland",
+        "sanksjon",
+        "ukraina",
+        "utenriks",
+    ],
+    "Utdanning/forskning": [
+        "forskning",
+        "høyskole",
+        "khrono",
+        "student",
+        "universitet",
+        "utdanning",
+    ],
+}
 
 MAX_ARTICLES = 10
 MAX_PER_SOURCE = 3
 MAX_CANDIDATES_PER_SOURCE = 25
+TOP_ITEMS = 5
 SIMILAR_TITLE_THRESHOLD = 0.86
 
 
@@ -143,12 +194,6 @@ def clean_text(value, max_length=None):
     return text
 
 
-def clean_model_text(value):
-    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
-    lines = [re.sub(r"[ \t]+", " ", line).rstrip() for line in text.split("\n")]
-    return "\n".join(lines).strip()
-
-
 def fetch_feed(feed):
     response = requests.get(
         feed["url"],
@@ -172,9 +217,16 @@ def entry_text(entry):
     ).lower()
 
 
+def topics_for_text(text):
+    topics = []
+    for topic, keywords in TOPIC_KEYWORDS.items():
+        if any(keyword in text for keyword in keywords):
+            topics.append(topic)
+    return topics
+
+
 def is_political(entry):
-    text = entry_text(entry)
-    return any(keyword in text for keyword in POLITICAL_KEYWORDS)
+    return bool(topics_for_text(entry_text(entry)))
 
 
 def entry_source_name(entry, fallback):
@@ -186,7 +238,7 @@ def entry_source_name(entry, fallback):
 
 def entry_summary(entry):
     summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
-    return clean_text(summary, 280)
+    return clean_text(summary, 320)
 
 
 def entry_published(entry):
@@ -223,6 +275,26 @@ def is_duplicate(article, seen_links, seen_titles):
     return False
 
 
+def relevance_score(article):
+    score = len(article["topics"]) * 2
+    title = article["title"].lower()
+    summary = article["summary"].lower()
+
+    for keyword in ("regjering", "storting", "budsjett", "lov", "minister", "sikkerhet"):
+        if keyword in title:
+            score += 2
+        elif keyword in summary:
+            score += 1
+
+    if article["summary"]:
+        score += 1
+
+    if article["feed"].startswith("Google News"):
+        score -= 1
+
+    return score
+
+
 def collect_articles():
     articles = []
     seen_links = set()
@@ -248,7 +320,9 @@ def collect_articles():
         skipped_non_political = 0
         skipped_duplicates = 0
         for entry in feed.entries[:MAX_CANDIDATES_PER_SOURCE]:
-            political_match = feed_config.get("politics_feed") or is_political(entry)
+            text = entry_text(entry)
+            topics = topics_for_text(text)
+            political_match = feed_config.get("politics_feed") or bool(topics)
             if not political_match:
                 skipped_non_political += 1
                 continue
@@ -260,7 +334,9 @@ def collect_articles():
                 "title": clean_text(getattr(entry, "title", "Untitled"), 180),
                 "summary": entry_summary(entry),
                 "link": clean_text(getattr(entry, "link", ""), 500),
+                "topics": topics or ["Politikk"],
             }
+            article["score"] = relevance_score(article)
 
             if is_duplicate(article, seen_links, seen_titles):
                 skipped_duplicates += 1
@@ -278,11 +354,14 @@ def collect_articles():
             f"{skipped_duplicates} duplicate articles."
         )
 
-    return articles[:MAX_ARTICLES]
+    return sorted(articles, key=lambda article: article["score"], reverse=True)[:MAX_ARTICLES]
 
 
-def articles_json(articles):
-    return json.dumps(articles, ensure_ascii=False, indent=2)
+def truncate_text(text, max_length):
+    value = str(text or "")
+    if len(value) <= max_length:
+        return value
+    return value[: max_length - 3].rstrip() + "..."
 
 
 def article_markdown_title(article):
@@ -293,119 +372,60 @@ def article_markdown_title(article):
     return title
 
 
-def fallback_summary(articles):
-    top = articles[:5]
-    lines = [
-        "**Dagens mønster**",
-        "Modellen leverte tomt svar, så dette er en nøktern automatisk briefing basert direkte på RSS-dataene. Det er mindre elegant, men langt mindre fantasifullt.",
-        "",
-        "**Toppsaker**",
-    ]
-
-    for index, article in enumerate(top, start=1):
-        summary = article["summary"] or "RSS-kilden hadde ikke noe sammendrag, bare tittel og lenke."
-        source = article["source"] or article["feed"] or "Ukjent kilde"
-        published = article["published"] or "ukjent tidspunkt"
-        lines.append(f"{index}. **{article_markdown_title(article)}**")
-        lines.append(f"   Kort: {summary}")
-        lines.append(f"   Kilde: {source}, publisert {published}.")
-        lines.append("   Følg med på: Om saken får konkret politisk oppfølging eller bare blir enda en runde med posisjonering.")
-
-    lines.append("")
-    lines.append("**Kildemerknad**")
-    lines.append("Reserveoppsummeringen bruker kun tittel, sammendrag, kilde, dato og lenke fra RSS-feedene.")
-    return "\n".join(lines)
+def watch_line(article):
+    topics = set(article["topics"])
+    if "Budsjett/økonomi" in topics:
+        return "Om dette blir et reelt budsjettkrav, eller bare en lekkasje med kort halveringstid."
+    if "Regjering/Storting" in topics:
+        return "Om saken får proposisjon, vedtak eller partipolitisk etterspill."
+    if "Kommune/forvaltning" in topics:
+        return "Om ansvaret faktisk flyttes, eller bare parkeres hos neste forvaltningsnivå."
+    if "Justis/sikkerhet" in topics:
+        return "Om krav om penger, hjemler eller kapasitet følger etter overskriften."
+    if "Utenriks/EØS" in topics:
+        return "Om Norge må posisjonere seg, eller kan holde seg til standard bekymringsspråk."
+    if "Utdanning/forskning" in topics:
+        return "Om sektoren får styringssignal, finansiering eller bare nye forventninger."
+    return "Om saken får konkret politisk oppfølging, eller bare blir en dagsordenmarkør."
 
 
-def summarize(articles, openrouter_api_key):
-    prompt = f"""
-Du skriver en norsk politisk morgenbriefing for en leser med mastergrad i politikk.
+def briefing_pattern(articles):
+    topic_counts = Counter(topic for article in articles for topic in article["topics"])
+    source_counts = Counter(article["source"] for article in articles)
+    top_topics = [topic for topic, _ in topic_counts.most_common(3)]
+    top_sources = [source for source, _ in source_counts.most_common(3)]
 
-Du får KUN strukturerte RSS-artikler som JSON. Bruk bare disse feltene: title, source, published, summary og link.
-Ikke inventer fakta, årsaker, konsekvenser, aktører eller bakgrunn som ikke finnes i JSON-dataene.
-Hvis datagrunnlaget er tynt, skriv nøkternt at saken bør følges, ikke fyll inn med gjetning.
+    if top_topics:
+        topic_text = ", ".join(top_topics).lower()
+    else:
+        topic_text = "generell politikk"
 
-Stil:
-- Norsk bokmål.
-- Konsis, analytisk og litt kynisk.
-- Ikke skoleaktig. Ikke forklar banale institusjonelle selvfølgeligheter.
-- Ikke bruk Markdown-tabeller.
-- Velg maks 5 saker.
-- Hver sak skal ha klikkbar lenke i tittelen: **[Tittel](link)**.
-- Bruk bare lenker fra JSON-dataene.
-
-Format:
-**Dagens mønster**
-2-3 korte analytiske setninger basert på artiklene.
-
-**Toppsaker**
-1. **[Tittel](link)**
-   Kort: ...
-   Konfliktlinje: ...
-   Følg med på: ...
-
-**Kildemerknad**
-1 kort setning om hva materialet dekker godt eller dårlig.
-
-JSON-artikler:
-{articles_json(articles)}
-"""
-
-    response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {openrouter_api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": OPENROUTER_MODEL,
-            "messages": [
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.15,
-            "max_tokens": 1500,
-            "reasoning": {"effort": "none", "exclude": True},
-        },
-        timeout=60,
+    source_text = ", ".join(top_sources) if top_sources else "RSS-kildene"
+    return (
+        f"Tyngdepunktet i materialet ligger i {topic_text}. "
+        f"Kildebildet er dominert av {source_text}, så dette bør leses som en rask morgenradar, ikke en full dagsanalyse. "
+        "Briefingen bruker bare RSS-data: tittel, kilde, dato, sammendrag og lenke."
     )
-    response.raise_for_status()
-    response_data = response.json()
-
-    if "error" in response_data:
-        raise RuntimeError(f"OpenRouter API error: {response_data['error']}")
-
-    try:
-        message = response_data["choices"][0]["message"]
-    except (KeyError, IndexError) as exc:
-        raise RuntimeError(f"Unexpected OpenRouter response: {response_data}") from exc
-
-    content = message.get("content")
-    if isinstance(content, list):
-        content = "\n".join(
-            part.get("text", "") if isinstance(part, dict) else str(part)
-            for part in content
-        )
-
-    clean_content = clean_model_text(content)
-    if not clean_content:
-        selected_model = response_data.get("model", OPENROUTER_MODEL)
-        finish_reason = response_data.get("choices", [{}])[0].get("finish_reason", "unknown")
-        print(
-            "Warning: model returned empty content, using fallback summary. "
-            f"model={selected_model}, finish_reason={finish_reason}"
-        )
-        return fallback_summary(articles)
-
-    return clean_content
 
 
-def truncate_text(text, max_length):
-    if text is None:
-        return ""
-    value = str(text)
-    if len(value) <= max_length:
-        return value
-    return value[: max_length - 3].rstrip() + "..."
+def article_field_value(article):
+    summary = article["summary"] or "RSS-kilden har bare tittel og lenke for denne saken."
+    source = article["source"] or article["feed"] or "Ukjent kilde"
+    published = article["published"] or "ukjent tidspunkt"
+    topics = ", ".join(article["topics"])
+
+    return truncate_text(
+        "\n".join(
+            [
+                f"**{article_markdown_title(article)}**",
+                f"Kilde: {source} | {published}",
+                f"Tema: {topics}",
+                f"Kort: {summary}",
+                f"Følg med på: {watch_line(article)}",
+            ]
+        ),
+        1024,
+    )
 
 
 def source_links(articles, max_length=1000):
@@ -424,18 +444,29 @@ def source_links(articles, max_length=1000):
     return "\n".join(links) or "Ingen lenker tilgjengelig"
 
 
-def post_to_discord(summary, articles, webhook_url):
+def post_to_discord(articles, webhook_url):
+    top_articles = articles[:TOP_ITEMS]
+    fields = [
+        {
+            "name": f"{index}. {truncate_text(article['source'], 80)}",
+            "value": article_field_value(article),
+            "inline": False,
+        }
+        for index, article in enumerate(top_articles, start=1)
+    ]
+    fields.append(
+        {
+            "name": "Kilder",
+            "value": source_links(top_articles),
+            "inline": False,
+        }
+    )
+
     embed = {
-        "title": "Morning Political Briefing",
-        "description": truncate_text(summary, 3900),
+        "title": "Politisk morgenbrief",
+        "description": truncate_text(briefing_pattern(articles), 700),
         "color": 3447003,
-        "fields": [
-            {
-                "name": "Kilder",
-                "value": source_links(articles),
-                "inline": False,
-            }
-        ],
+        "fields": fields,
         "footer": {
             "text": f"{len(articles)} politiske saker vurdert fra {len(FEEDS)} feeds"
         },
@@ -451,7 +482,6 @@ def post_to_discord(summary, articles, webhook_url):
 
 
 def main():
-    openrouter_api_key = get_required_env("OPENROUTER_API_KEY")
     discord_webhook_url = get_required_env("DISCORD_WEBHOOK_URL")
     require_discord_webhook_url(discord_webhook_url)
 
@@ -460,8 +490,7 @@ def main():
         print("No political articles found in configured feeds.")
         sys.exit(1)
 
-    summary = summarize(articles, openrouter_api_key)
-    post_to_discord(summary, articles, discord_webhook_url)
+    post_to_discord(articles, discord_webhook_url)
     print("Briefing posted to Discord.")
 
 
