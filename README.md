@@ -12,10 +12,13 @@ Automated daily briefings on Norwegian political developments, delivered to Disc
 ## Features
 
 - Fetches open Norwegian politics and news RSS feeds
-- Stores title, source, published date, summary, link, and inferred political topics for each article
-- Deduplicates by link and similar title
-- Uses source quotas so one feed cannot dominate the whole briefing
-- Filters for politics-related items before posting
-- Ranks articles by political relevance signals
+- Uses only RSS metadata: title, source, date, summary/description, and link
+- Scores articles with deterministic weighted political relevance rules
+- Applies negative keyword penalties for sport, celebrities, weather, lifestyle, campus trivia, and entertainment
+- Filters out weak policy-angle stories before posting
+- Boosts stronger political sources and reduces generic/local/clickbait sources
+- Tags articles by policy area, including budget, security, municipalities, health, education, AI/digitalization, climate/energy, and foreign policy
+- Generates short rule-based observations from counts and source patterns
 - Posts a deterministic Discord embed with clickable links for each item
-- Avoids AI-generated prose by default to keep the briefing readable and grounded in source data
+- Prints debugging details for fetched counts, exclusions, reasons, and final scores
+- Avoids LLM-generated prose to keep the briefing grounded and non-hallucinated
