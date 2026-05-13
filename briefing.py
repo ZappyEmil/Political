@@ -1,6 +1,9 @@
+import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from urllib.parse import urlparse
 
 import feedparser
@@ -83,6 +86,7 @@ POLITICAL_KEYWORDS = [
 MAX_ARTICLES = 14
 MAX_PER_SOURCE = 3
 MAX_CANDIDATES_PER_SOURCE = 25
+SIMILAR_TITLE_THRESHOLD = 0.86
 
 
 def require_env(name, value):
@@ -130,6 +134,14 @@ def clean_xml_text(text):
     return "".join(char for char in text if is_valid_xml_char(char))
 
 
+def clean_text(value, max_length=None):
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    if max_length and len(text) > max_length:
+        return text[: max_length - 3].rstrip() + "..."
+    return text
+
+
 def fetch_feed(feed):
     response = requests.get(
         feed["url"],
@@ -144,7 +156,7 @@ def fetch_feed(feed):
 
 def entry_text(entry):
     return " ".join(
-        str(value)
+        clean_text(value)
         for value in [
             getattr(entry, "title", ""),
             getattr(entry, "summary", ""),
@@ -161,13 +173,53 @@ def is_political(entry):
 def entry_source_name(entry, fallback):
     source = getattr(entry, "source", None)
     if source and getattr(source, "title", None):
-        return source.title
+        return clean_text(source.title, 80)
     return fallback
+
+
+def entry_summary(entry):
+    summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
+    return clean_text(summary, 500)
+
+
+def entry_published(entry):
+    for attribute in ("published", "updated", "created"):
+        value = getattr(entry, attribute, "")
+        if value:
+            return clean_text(value, 120)
+    return ""
+
+
+def normalized_title(title):
+    title = clean_text(title).lower()
+    title = re.sub(r"\s+-\s+[^-]+$", "", title)
+    title = re.sub(r"[^a-zæøå0-9 ]+", " ", title)
+    return re.sub(r"\s+", " ", title).strip()
+
+
+def is_duplicate(article, seen_links, seen_titles):
+    link = article["link"]
+    title = normalized_title(article["title"])
+
+    if link and link in seen_links:
+        return True
+
+    for seen_title in seen_titles:
+        if SequenceMatcher(None, title, seen_title).ratio() >= SIMILAR_TITLE_THRESHOLD:
+            return True
+
+    if link:
+        seen_links.add(link)
+    if title:
+        seen_titles.append(title)
+
+    return False
 
 
 def collect_articles():
     articles = []
-    seen = set()
+    seen_links = set()
+    seen_titles = []
 
     for feed_config in FEEDS:
         feed_name = feed_config["name"]
@@ -187,82 +239,77 @@ def collect_articles():
 
         added_from_source = 0
         skipped_non_political = 0
+        skipped_duplicates = 0
         for entry in feed.entries[:MAX_CANDIDATES_PER_SOURCE]:
-            title = getattr(entry, "title", "Untitled")
-            link = getattr(entry, "link", "")
-            unique_key = link or title
             political_match = feed_config.get("politics_feed") or is_political(entry)
-
             if not political_match:
                 skipped_non_political += 1
                 continue
 
-            if unique_key in seen:
+            article = {
+                "feed": feed_name,
+                "source": entry_source_name(entry, feed_name),
+                "published": entry_published(entry),
+                "title": clean_text(getattr(entry, "title", "Untitled"), 180),
+                "summary": entry_summary(entry),
+                "link": clean_text(getattr(entry, "link", ""), 500),
+            }
+
+            if is_duplicate(article, seen_links, seen_titles):
+                skipped_duplicates += 1
                 continue
 
-            seen.add(unique_key)
-            articles.append(
-                {
-                    "feed": feed_name,
-                    "source": entry_source_name(entry, feed_name),
-                    "title": title,
-                    "link": link,
-                }
-            )
+            articles.append(article)
             added_from_source += 1
 
             if added_from_source >= MAX_PER_SOURCE:
                 break
 
         print(
-            f"Collected {added_from_source} political articles from {feed_name} "
-            f"and skipped {skipped_non_political} non-political articles."
+            f"Collected {added_from_source} political articles from {feed_name}; "
+            f"skipped {skipped_non_political} non-political and "
+            f"{skipped_duplicates} duplicate articles."
         )
 
     return articles[:MAX_ARTICLES]
 
 
-def format_articles_for_prompt(articles):
-    lines = []
-    for index, article in enumerate(articles, start=1):
-        link = article["link"] or "No link"
-        lines.append(
-            f"{index}. [{article['source']} via {article['feed']}] {article['title']}\n"
-            f"   {link}"
-        )
-    return "\n".join(lines)
+def articles_json(articles):
+    return json.dumps(articles, ensure_ascii=False, indent=2)
 
 
 def summarize(articles, openrouter_api_key):
-    news_text = format_articles_for_prompt(articles)
     prompt = f"""
-Skriv en norsk politisk morgenbriefing for en leser med mastergrad i politikk.
+Du skriver en norsk politisk morgenbriefing for en leser med mastergrad i politikk.
 
-Strenge regler:
-- Ta bare med saker med reell politisk relevans: makt, institusjoner, partier, styring, budsjett, lovverk, forvaltning, velferd, justis, energi, sikkerhetspolitikk eller utenrikspolitikk.
-- Ikke forklar banale ting som at kommuner har ansvar, at Stortinget vedtar lover, eller at budsjett påvirker prioriteringer.
-- Ikke bruk skoleaktige formuleringer som "dette viser hvordan" eller generiske setninger uten analytisk verdi.
+Du får KUN strukturerte RSS-artikler som JSON. Bruk bare disse feltene: title, source, published, summary og link.
+Ikke inventer fakta, årsaker, konsekvenser, aktører eller bakgrunn som ikke finnes i JSON-dataene.
+Hvis datagrunnlaget er tynt, skriv nøkternt at saken bør følges, ikke fyll inn med gjetning.
+
+Stil:
+- Norsk bokmål.
+- Konsis, analytisk og litt kynisk.
+- Ikke skoleaktig. Ikke forklar banale institusjonelle selvfølgeligheter.
 - Ikke bruk Markdown-tabeller.
 - Velg maks 5 saker.
-- Skriv substansielt, men stramt. Hver sak kan ha 3-5 setninger.
-- Vær eksplisitt om konfliktlinje, aktører, maktmidler, budsjettmessig/institusjonell betydning og hva som bør følges videre.
-- Ikke dikte detaljer som ikke finnes i sakstitlene. Marker usikkerhet nøkternt hvis grunnlaget er tynt.
-
-Saker:
-{news_text}
+- Hver sak skal ha klikkbar lenke i tittelen: **[Tittel](link)**.
+- Bruk bare lenker fra JSON-dataene.
 
 Format:
 **Dagens mønster**
-2-3 analytiske setninger om den samlede politiske tendensen.
+2-3 korte analytiske setninger basert på artiklene.
 
 **Toppsaker**
-1. **Tittel**
+1. **[Tittel](link)**
    Kort: ...
    Konfliktlinje: ...
    Følg med på: ...
 
-**Kilder vurdert**
-Kort setning om kildemiks og eventuelle hull i materialet.
+**Kildemerknad**
+1 kort setning om hva materialet dekker godt eller dårlig.
+
+JSON-artikler:
+{articles_json(articles)}
 """
 
     response = requests.post(
@@ -276,8 +323,8 @@ Kort setning om kildemiks og eventuelle hull i materialet.
             "messages": [
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.25,
-            "max_tokens": 1400,
+            "temperature": 0.15,
+            "max_tokens": 1500,
         },
         timeout=60,
     )
@@ -301,7 +348,7 @@ def truncate_text(text, max_length):
 
 def source_links(articles):
     links = []
-    for article in articles[:10]:
+    for article in articles:
         if article["link"]:
             title = truncate_text(article["title"], 70)
             links.append(f"[{title}]({article['link']})")
