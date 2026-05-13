@@ -7,7 +7,7 @@ Automated daily briefings on Norwegian political developments, delivered to Disc
 1. Add this secret to the GitHub repo:
    - `DISCORD_WEBHOOK_URL`
 
-2. The workflow runs automatically every day at 06:00 UTC via GitHub Actions, and can also be triggered manually from the Actions tab.
+2. The workflow runs automatically every day at 06:00 UTC via GitHub Actions. That is normally 08:00 in Norway during summer time and 07:00 during winter time. It can also be triggered manually from the Actions tab.
 
 ## Features
 
@@ -22,3 +22,22 @@ Automated daily briefings on Norwegian political developments, delivered to Disc
 - Posts a deterministic Discord embed with clickable links for each item
 - Prints debugging details for fetched counts, exclusions, reasons, and final scores
 - Avoids LLM-generated prose to keep the briefing grounded and non-hallucinated
+
+## Source Mix
+
+The bot fetches up to 30 candidates per feed, scores them, then keeps only the strongest articles within each source quota before doing the final ranking. `MAX_ARTICLES` is set to 24 for the internal ranked pool, while the Discord post shows the top 6 stories to keep the briefing readable.
+
+| Feed | Max articles kept |
+| --- | ---: |
+| E24 Makro og politikk | 4 |
+| Khrono | 3 |
+| NRK Toppsaker | 4 |
+| NRK Siste nytt | 4 |
+| Nettavisen Nyheter | 3 |
+| Google News: Altinget | 2 |
+| Google News: Aftenposten politikk | 2 |
+| Google News: VG politikk | 2 |
+| Google News: Politiforum | 2 |
+| Google News: Kommunal Rapport | 2 |
+| Google News: norsk politikk | 2 |
+| Google News: Stortinget og regjeringen | 2 |
