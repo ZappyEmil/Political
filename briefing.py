@@ -7,47 +7,86 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+OSLO_TZ = ZoneInfo("Europe/Oslo")
 
 FEEDS = [
     {
         "name": "E24 Makro og politikk",
         "url": "https://e24.no/rss2/?seksjon=makro-og-politikk",
         "politics_feed": True,
+        "max_per_source": 4,
     },
     {
         "name": "Khrono",
         "url": "https://www.khrono.no/?lab_viewport=rss",
         "politics_feed": False,
+        "max_per_source": 3,
     },
     {
         "name": "NRK Toppsaker",
         "url": "https://www.nrk.no/toppsaker.rss",
         "politics_feed": False,
+        "max_per_source": 4,
     },
     {
         "name": "NRK Siste nytt",
         "url": "https://www.nrk.no/nyheter/siste.rss",
         "politics_feed": False,
+        "max_per_source": 4,
     },
     {
         "name": "Nettavisen Nyheter",
         "url": "https://www.nettavisen.no/service/rich-rss?tag=nyheter",
         "politics_feed": False,
+        "max_per_source": 3,
+    },
+    {
+        "name": "Google News: Altinget",
+        "url": "https://news.google.com/rss/search?q=site%3Aaltinget.no%20politikk&hl=no&gl=NO&ceid=NO:no",
+        "politics_feed": True,
+        "max_per_source": 2,
+    },
+    {
+        "name": "Google News: Aftenposten politikk",
+        "url": "https://news.google.com/rss/search?q=site%3Aaftenposten.no%20politikk&hl=no&gl=NO&ceid=NO:no",
+        "politics_feed": True,
+        "max_per_source": 2,
+    },
+    {
+        "name": "Google News: VG politikk",
+        "url": "https://news.google.com/rss/search?q=site%3Avg.no%20politikk&hl=no&gl=NO&ceid=NO:no",
+        "politics_feed": True,
+        "max_per_source": 2,
+    },
+    {
+        "name": "Google News: Politiforum",
+        "url": "https://news.google.com/rss/search?q=site%3Apolitiforum.no%20politi%20OR%20regjeringen&hl=no&gl=NO&ceid=NO:no",
+        "politics_feed": True,
+        "max_per_source": 2,
+    },
+    {
+        "name": "Google News: Kommunal Rapport",
+        "url": "https://news.google.com/rss/search?q=site%3Akommunal-rapport.no%20kommune%20politikk&hl=no&gl=NO&ceid=NO:no",
+        "politics_feed": True,
+        "max_per_source": 2,
     },
     {
         "name": "Google News: norsk politikk",
         "url": "https://news.google.com/rss/search?q=norsk%20politikk&hl=no&gl=NO&ceid=NO:no",
         "politics_feed": True,
+        "max_per_source": 2,
     },
     {
         "name": "Google News: Stortinget og regjeringen",
         "url": "https://news.google.com/rss/search?q=Stortinget%20OR%20regjeringen&hl=no&gl=NO&ceid=NO:no",
         "politics_feed": True,
+        "max_per_source": 2,
     },
 ]
 
@@ -198,6 +237,7 @@ SOURCE_BOOSTS = {
     "regjeringen": 18,
     "altinget": 14,
     "aftenposten": 11,
+    "kommunal rapport": 9,
     "nrk": 9,
     "vg": 7,
     "e24": 12,
@@ -246,13 +286,14 @@ CLICKBAIT_PATTERNS = [
     "sjokk",
 ]
 
-MAX_ARTICLES = 12
-MAX_PER_SOURCE = 4
+MAX_ARTICLES = 18
+DEFAULT_MAX_PER_SOURCE = 3
 MAX_CANDIDATES_PER_SOURCE = 30
-TOP_ITEMS = 5
+TOP_ITEMS = 6
 SIMILAR_TITLE_THRESHOLD = 0.86
 MIN_SCORE = 20
 MIN_HIGH_SIGNAL_SCORE = 12
+FIELD_VALUE_LIMIT = 700
 
 
 def require_env(name, value):
@@ -381,13 +422,13 @@ def parse_date(value):
     raw = str(value).strip()
     if raw.isdigit():
         parsed = datetime.fromtimestamp(int(raw), tz=timezone.utc)
-        return parsed.strftime("%Y-%m-%d %H:%M UTC")
+        return parsed.astimezone(OSLO_TZ).strftime("%Y-%m-%d %H:%M %Z")
 
     try:
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        return parsed.astimezone(OSLO_TZ).strftime("%Y-%m-%d %H:%M %Z")
     except ValueError:
         pass
 
@@ -395,7 +436,7 @@ def parse_date(value):
         parsed = parsedate_to_datetime(raw)
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        return parsed.astimezone(OSLO_TZ).strftime("%Y-%m-%d %H:%M %Z")
     except (TypeError, ValueError, OverflowError):
         return clean_text(raw, 120)
 
@@ -551,6 +592,7 @@ def collect_articles():
 
     for feed_config in FEEDS:
         feed_name = feed_config["name"]
+        max_for_source = feed_config.get("max_per_source", DEFAULT_MAX_PER_SOURCE)
 
         try:
             feed = fetch_feed(feed_config)
@@ -583,7 +625,7 @@ def collect_articles():
             articles.append(article)
             added_from_source += 1
 
-            if added_from_source >= MAX_PER_SOURCE:
+            if added_from_source >= max_for_source:
                 break
 
         print(f"Accepted {added_from_source} articles from {feed_name}.")
@@ -612,15 +654,7 @@ def truncate_text(text, max_length):
 
 
 def today_label():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
-def article_markdown_title(article):
-    title = article["title"] or "Uten tittel"
-    link = article["link"] or ""
-    if link:
-        return f"[{title}]({link})"
-    return title
+    return datetime.now(OSLO_TZ).strftime("%Y-%m-%d")
 
 
 def observations(articles):
@@ -668,7 +702,7 @@ def article_field_value(article):
                 f"Lenke: {link}",
             ]
         ),
-        1024,
+        FIELD_VALUE_LIMIT,
     )
 
 
@@ -677,7 +711,7 @@ def post_to_discord(articles, webhook_url):
     fields = [
         {
             "name": "Kort vurdering",
-            "value": truncate_text(observations(articles), 1024),
+            "value": truncate_text(observations(articles), 700),
             "inline": False,
         }
     ]
@@ -685,7 +719,7 @@ def post_to_discord(articles, webhook_url):
     for index, article in enumerate(top_articles, start=1):
         fields.append(
             {
-                "name": f"{index}. {truncate_text(article['title'], 240)}",
+                "name": f"{index}. {truncate_text(article['title'], 150)}",
                 "value": article_field_value(article),
                 "inline": False,
             }
