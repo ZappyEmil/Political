@@ -12,7 +12,6 @@ from zoneinfo import ZoneInfo
 import feedparser
 import requests
 
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 OSLO_TZ = ZoneInfo("Europe/Oslo")
 
 FEEDS = [
@@ -286,14 +285,16 @@ CLICKBAIT_PATTERNS = [
     "sjokk",
 ]
 
-MAX_ARTICLES = 18
+MAX_ARTICLES = 24
 DEFAULT_MAX_PER_SOURCE = 3
 MAX_CANDIDATES_PER_SOURCE = 30
 TOP_ITEMS = 6
 SIMILAR_TITLE_THRESHOLD = 0.86
 MIN_SCORE = 20
 MIN_HIGH_SIGNAL_SCORE = 12
+FIELD_NAME_LIMIT = 130
 FIELD_VALUE_LIMIT = 700
+OBSERVATION_LIMIT = 650
 
 
 def require_env(name, value):
@@ -571,7 +572,7 @@ def build_article(entry, feed_config, feed_name):
         "published": entry_published(entry),
         "title": title,
         "summary": summary,
-        "link": clean_text(getattr(entry, "link", ""), 500),
+        "link": clean_text(getattr(entry, "link", "")),
         "tags": tags,
         "high_score": high_score,
         "high_matches": high_matches,
@@ -605,9 +606,9 @@ def collect_articles():
 
         entries = feed.entries[:MAX_CANDIDATES_PER_SOURCE]
         fetched_count += len(entries)
+        source_candidates = []
         print(f"Fetched {len(entries)} entries from {feed_name}.")
 
-        added_from_source = 0
         for entry in entries:
             article = build_article(entry, feed_config, feed_name)
             reason = exclusion_reason(article)
@@ -617,6 +618,10 @@ def collect_articles():
                 print(f"Excluded [{reason}]: {article['title']} ({article['source']})")
                 continue
 
+            source_candidates.append(article)
+
+        added_from_source = 0
+        for article in sorted(source_candidates, key=lambda item: item["score"], reverse=True):
             if is_duplicate(article, seen_links, seen_titles):
                 excluded.append(("duplicate", article))
                 print(f"Excluded [duplicate]: {article['title']} ({article['source']})")
@@ -628,11 +633,15 @@ def collect_articles():
             if added_from_source >= max_for_source:
                 break
 
-        print(f"Accepted {added_from_source} articles from {feed_name}.")
+        print(
+            f"Accepted {added_from_source} articles from {feed_name} "
+            f"after scoring {len(source_candidates)} candidates."
+        )
 
     ranked = sorted(articles, key=lambda article: article["score"], reverse=True)[:MAX_ARTICLES]
     print(f"Fetched total: {fetched_count}")
     print(f"Filtered/accepted total before ranking: {len(articles)}")
+    print(f"Ranked total sent to briefing: {len(ranked)}")
     print(f"Excluded total: {len(excluded)}")
 
     for article in ranked:
@@ -687,23 +696,26 @@ def observations(articles):
     return "\n".join(lines[:2])
 
 
+def discord_link(url):
+    if not url:
+        return "Ingen lenke"
+    safe_url = url.replace(" ", "%20").replace(")", "%29")
+    return f"[Åpne saken]({safe_url})"
+
+
 def article_field_value(article):
     summary = article["summary"] or "RSS-kilden har bare tittel og lenke for denne saken."
     tags = ", ".join(article["tags"]) or "Uklart"
-    link = article["link"] or "Ingen lenke"
-
-    return truncate_text(
-        "\n".join(
-            [
-                f"Kilde: {article['source']}",
-                f"Dato: {article['published'] or 'ukjent'}",
-                f"Tema: {tags}",
-                f"Kort: {summary}",
-                f"Lenke: {link}",
-            ]
-        ),
-        FIELD_VALUE_LIMIT,
-    )
+    header_lines = [
+        f"Kilde: {article['source']}",
+        f"Dato: {article['published'] or 'ukjent'}",
+        f"Tema: {tags}",
+    ]
+    link_line = f"Lenke: {discord_link(article['link'])}"
+    fixed_length = len("\n".join(header_lines + ["Kort: ", link_line]))
+    summary_limit = max(80, FIELD_VALUE_LIMIT - fixed_length - 1)
+    value = "\n".join(header_lines + [f"Kort: {truncate_text(summary, summary_limit)}", link_line])
+    return truncate_text(value, FIELD_VALUE_LIMIT)
 
 
 def post_to_discord(articles, webhook_url):
@@ -711,7 +723,7 @@ def post_to_discord(articles, webhook_url):
     fields = [
         {
             "name": "Kort vurdering",
-            "value": truncate_text(observations(articles), 700),
+            "value": truncate_text(observations(articles), OBSERVATION_LIMIT),
             "inline": False,
         }
     ]
@@ -719,7 +731,7 @@ def post_to_discord(articles, webhook_url):
     for index, article in enumerate(top_articles, start=1):
         fields.append(
             {
-                "name": f"{index}. {truncate_text(article['title'], 150)}",
+                "name": f"{index}. {truncate_text(article['title'], FIELD_NAME_LIMIT)}",
                 "value": article_field_value(article),
                 "inline": False,
             }
@@ -727,7 +739,7 @@ def post_to_discord(articles, webhook_url):
 
     embed = {
         "title": f"🇳🇴 Politisk morgenbrief — {today_label()}",
-        "description": "Toppsaker valgt med deterministisk scoring. Ingen LLM-oppsummering.",
+        "description": "Toppsaker fra åpne RSS-kilder, valgt med regelbasert scoring.",
         "color": 3447003,
         "fields": fields,
         "footer": {
@@ -741,6 +753,8 @@ def post_to_discord(articles, webhook_url):
         json={"embeds": [embed]},
         timeout=30,
     )
+    if response.status_code >= 400:
+        print(f"Discord webhook failed ({response.status_code}): {response.text[:500]}")
     response.raise_for_status()
 
 
