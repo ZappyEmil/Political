@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import feedparser
@@ -12,46 +13,60 @@ FEEDS = [
     {
         "name": "NRK Toppsaker",
         "url": "https://www.nrk.no/toppsaker.rss",
+        "politics_only": False,
     },
     {
         "name": "NRK Siste nytt",
         "url": "https://www.nrk.no/nyheter/siste.rss",
+        "politics_only": False,
     },
     {
         "name": "E24 Makro og politikk",
         "url": "https://e24.no/rss2/?seksjon=makro-og-politikk",
+        "politics_only": True,
     },
     {
         "name": "Nettavisen Nyheter",
         "url": "https://www.nettavisen.no/service/rich-rss?tag=nyheter",
+        "politics_only": False,
     },
 ]
 
 POLITICAL_KEYWORDS = [
-    "ap",
     "arbeiderpartiet",
-    "erna",
+    "bystyre",
+    "departement",
     "eos",
     "eøs",
+    "finansminister",
     "frp",
     "hoyre",
     "høyre",
     "kommune",
+    "kommunestyre",
+    "krf",
+    "lovforslag",
     "minister",
-    "parti",
+    "partiet",
+    "politiker",
     "politikk",
     "regjering",
+    "regjeringen",
     "rodt",
     "rødt",
-    "sp",
-    "stoltenberg",
+    "senterpartiet",
+    "statsbudsjett",
+    "statsminister",
     "storting",
-    "store",
+    "stortinget",
     "støre",
     "sv",
-    "valg",
     "venstre",
+    "valg",
 ]
+
+MAX_ARTICLES = 12
+MAX_PER_SOURCE = 8
 
 
 def require_env(name, value):
@@ -111,8 +126,8 @@ def fetch_feed(feed):
     return feedparser.parse(cleaned_text)
 
 
-def is_political(entry):
-    text = " ".join(
+def entry_text(entry):
+    return " ".join(
         str(value)
         for value in [
             getattr(entry, "title", ""),
@@ -120,6 +135,10 @@ def is_political(entry):
             getattr(entry, "description", ""),
         ]
     ).lower()
+
+
+def is_political(entry):
+    text = entry_text(entry)
     return any(keyword in text for keyword in POLITICAL_KEYWORDS)
 
 
@@ -144,48 +163,75 @@ def collect_articles():
             continue
 
         added_from_source = 0
-        for entry in feed.entries[:15]:
+        skipped_non_political = 0
+        for entry in feed.entries[:20]:
             title = getattr(entry, "title", "Untitled")
             link = getattr(entry, "link", "")
             unique_key = link or title
+            political_match = is_political(entry)
+
+            if not feed_config.get("politics_only") and not political_match:
+                skipped_non_political += 1
+                continue
 
             if unique_key in seen:
                 continue
 
             seen.add(unique_key)
-            prefix = "*" if is_political(entry) else "-"
-            if link:
-                articles.append(f"{prefix} [{source_name}] {title}\n  {link}")
-            else:
-                articles.append(f"{prefix} [{source_name}] {title}")
+            article = {
+                "source": source_name,
+                "title": title,
+                "link": link,
+            }
+            articles.append(article)
             added_from_source += 1
 
-            if len(articles) >= 30:
+            if added_from_source >= MAX_PER_SOURCE or len(articles) >= MAX_ARTICLES:
                 break
 
-        print(f"Collected {added_from_source} articles from {source_name}.")
+        print(
+            f"Collected {added_from_source} political articles from {source_name} "
+            f"and skipped {skipped_non_political} non-political articles."
+        )
 
-        if len(articles) >= 30:
+        if len(articles) >= MAX_ARTICLES:
             break
 
     return articles
 
 
-def summarize(news_text, openrouter_api_key):
+def format_articles_for_prompt(articles):
+    lines = []
+    for index, article in enumerate(articles, start=1):
+        link = article["link"] or "No link"
+        lines.append(f"{index}. [{article['source']}] {article['title']}\n   {link}")
+    return "\n".join(lines)
+
+
+def summarize(articles, openrouter_api_key):
+    news_text = format_articles_for_prompt(articles)
     prompt = f"""
-Summarize these Norwegian news items as a short Norwegian political briefing.
+Skriv en norsk politisk briefing for Discord basert kun på sakene under.
 
-Items marked with * matched political keywords. Prioritize those items, but include other major national developments if they matter politically.
+Strenge regler:
+- Ta bare med politikk, offentlig styring, partier, Storting/regjering, kommunepolitikk, lovverk, skatt, budsjett, velferd, justis, energi eller utenriks/sikkerhetspolitikk.
+- Ikke ta med sport, kjendiser, forbrukerstoff, ulykker eller generell krim med mindre saken har tydelig politisk konsekvens.
+- Ikke bruk Markdown-tabeller.
+- Skriv litt mer utfyllende enn en notis, men hold det lett å skanne.
+- Velg maks 5 saker.
+- For hver sak: tittel, kort forklaring, hvorfor det er politisk viktig.
 
+Saker:
 {news_text}
 
 Format:
+**Toppsaker**
+1. **Tittel**
+   Hva skjedde: ...
+   Politisk betydning: ...
 
-Toppsaker
-
-Hvorfor det betyr noe
-
-Keep concise.
+**Kort vurdering**
+2-3 setninger om hva dagens saker samlet peker mot.
 """
 
     response = requests.post(
@@ -214,16 +260,41 @@ Keep concise.
         raise RuntimeError(f"Unexpected OpenRouter response: {response_data}") from exc
 
 
-def post_to_discord(summary, webhook_url):
-    content = f"Morning Political Briefing\n\n{summary}"
+def truncate_text(text, max_length):
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 3].rstrip() + "..."
 
-    # Discord messages have a 2000 character limit.
-    if len(content) > 1900:
-        content = content[:1897] + "..."
+
+def source_links(articles):
+    links = []
+    for article in articles[:5]:
+        if article["link"]:
+            links.append(f"[{article['source']}]({article['link']})")
+    return " | ".join(links) or "Ingen lenker tilgjengelig"
+
+
+def post_to_discord(summary, articles, webhook_url):
+    embed = {
+        "title": "Morning Political Briefing",
+        "description": truncate_text(summary, 3800),
+        "color": 3447003,
+        "fields": [
+            {
+                "name": "Kilder",
+                "value": truncate_text(source_links(articles), 1000),
+                "inline": False,
+            }
+        ],
+        "footer": {
+            "text": f"{len(articles)} politiske saker vurdert"
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
     response = requests.post(
         webhook_url,
-        json={"content": content},
+        json={"embeds": [embed]},
         timeout=30,
     )
     response.raise_for_status()
@@ -236,12 +307,11 @@ def main():
 
     articles = collect_articles()
     if not articles:
-        print("No articles found in configured feeds.")
+        print("No political articles found in configured feeds.")
         sys.exit(1)
 
-    news_text = "\n".join(articles)
-    summary = summarize(news_text, openrouter_api_key)
-    post_to_discord(summary, discord_webhook_url)
+    summary = summarize(articles, openrouter_api_key)
+    post_to_discord(summary, articles, discord_webhook_url)
     print("Briefing posted to Discord.")
 
 
