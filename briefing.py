@@ -11,6 +11,7 @@ import requests
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip() or "openrouter/free"
 
 FEEDS = [
     {
@@ -83,7 +84,7 @@ POLITICAL_KEYWORDS = [
     "valg",
 ]
 
-MAX_ARTICLES = 14
+MAX_ARTICLES = 10
 MAX_PER_SOURCE = 3
 MAX_CANDIDATES_PER_SOURCE = 25
 SIMILAR_TITLE_THRESHOLD = 0.86
@@ -142,6 +143,12 @@ def clean_text(value, max_length=None):
     return text
 
 
+def clean_model_text(value):
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[ \t]+", " ", line).rstrip() for line in text.split("\n")]
+    return "\n".join(lines).strip()
+
+
 def fetch_feed(feed):
     response = requests.get(
         feed["url"],
@@ -179,7 +186,7 @@ def entry_source_name(entry, fallback):
 
 def entry_summary(entry):
     summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
-    return clean_text(summary, 500)
+    return clean_text(summary, 280)
 
 
 def entry_published(entry):
@@ -278,29 +285,35 @@ def articles_json(articles):
     return json.dumps(articles, ensure_ascii=False, indent=2)
 
 
+def article_markdown_title(article):
+    title = article["title"] or "Uten tittel"
+    link = article["link"] or ""
+    if link:
+        return f"[{title}]({link})"
+    return title
+
+
 def fallback_summary(articles):
     top = articles[:5]
     lines = [
         "**Dagens mønster**",
-        "Kildene peker på flere parallelle politiske spor, men grunnlaget er for tynt til bastante konklusjoner.",
+        "Modellen leverte tomt svar, så dette er en nøktern automatisk briefing basert direkte på RSS-dataene. Det er mindre elegant, men langt mindre fantasifullt.",
         "",
         "**Toppsaker**",
     ]
 
     for index, article in enumerate(top, start=1):
-        link = article["link"] or ""
-        title = article["title"] or "Uten tittel"
-        published = article["published"] or "Ukjent tidspunkt"
+        summary = article["summary"] or "RSS-kilden hadde ikke noe sammendrag, bare tittel og lenke."
         source = article["source"] or article["feed"] or "Ukjent kilde"
-        linked_title = f"[{title}]({link})" if link else title
-        lines.append(f"{index}. **{linked_title}**")
-        lines.append(f"   Kort: {source}, publisert {published}.")
-        lines.append("   Konfliktlinje: Trenger mer detaljgrunnlag fra sakstekst før hard tolkning.")
-        lines.append("   Følg med på: Om saken får konkret oppfølging i partier, regjering eller Storting.")
+        published = article["published"] or "ukjent tidspunkt"
+        lines.append(f"{index}. **{article_markdown_title(article)}**")
+        lines.append(f"   Kort: {summary}")
+        lines.append(f"   Kilde: {source}, publisert {published}.")
+        lines.append("   Følg med på: Om saken får konkret politisk oppfølging eller bare blir enda en runde med posisjonering.")
 
     lines.append("")
     lines.append("**Kildemerknad**")
-    lines.append("Automatisk reserveoppsummering fordi modellsvaret var tomt eller ugyldig.")
+    lines.append("Reserveoppsummeringen bruker kun tittel, sammendrag, kilde, dato og lenke fra RSS-feedene.")
     return "\n".join(lines)
 
 
@@ -345,12 +358,13 @@ JSON-artikler:
             "Content-Type": "application/json",
         },
         json={
-            "model": "openrouter/free",
+            "model": OPENROUTER_MODEL,
             "messages": [
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.15,
             "max_tokens": 1500,
+            "reasoning": {"effort": "none", "exclude": True},
         },
         timeout=60,
     )
@@ -361,13 +375,25 @@ JSON-artikler:
         raise RuntimeError(f"OpenRouter API error: {response_data['error']}")
 
     try:
-        content = response_data["choices"][0]["message"].get("content")
+        message = response_data["choices"][0]["message"]
     except (KeyError, IndexError) as exc:
         raise RuntimeError(f"Unexpected OpenRouter response: {response_data}") from exc
 
-    clean_content = clean_text(content)
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "\n".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+
+    clean_content = clean_model_text(content)
     if not clean_content:
-        print("Warning: model returned empty content, using fallback summary.")
+        selected_model = response_data.get("model", OPENROUTER_MODEL)
+        finish_reason = response_data.get("choices", [{}])[0].get("finish_reason", "unknown")
+        print(
+            "Warning: model returned empty content, using fallback summary. "
+            f"model={selected_model}, finish_reason={finish_reason}"
+        )
         return fallback_summary(articles)
 
     return clean_content
@@ -382,12 +408,19 @@ def truncate_text(text, max_length):
     return value[: max_length - 3].rstrip() + "..."
 
 
-def source_links(articles):
+def source_links(articles, max_length=1000):
     links = []
+    used_length = 0
     for article in articles:
-        if article["link"]:
-            title = truncate_text(article["title"], 70)
-            links.append(f"[{title}]({article['link']})")
+        if not article["link"]:
+            continue
+        title = truncate_text(article["title"], 70)
+        item = f"[{title}]({article['link']})"
+        next_length = used_length + len(item) + (1 if links else 0)
+        if next_length > max_length:
+            break
+        links.append(item)
+        used_length = next_length
     return "\n".join(links) or "Ingen lenker tilgjengelig"
 
 
@@ -399,7 +432,7 @@ def post_to_discord(summary, articles, webhook_url):
         "fields": [
             {
                 "name": "Kilder",
-                "value": truncate_text(source_links(articles), 1000),
+                "value": source_links(articles),
                 "inline": False,
             }
         ],
