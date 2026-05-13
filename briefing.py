@@ -42,14 +42,27 @@ response = requests.post(
         "Content-Type": "application/json"
     },
     json={
-        "model": "inclusionai/ring-2.6-1t:free",
+        "model": "meta-llama/llama-2-7b-chat:free",
         "messages": [
             {"role": "user", "content": prompt}
         ]
     }
 )
 
-summary = response.json()["choices"][0]["message"]["content"]
+# Check for HTTP errors
+response.raise_for_status()
+response_data = response.json()
+
+# Check for API errors in response
+if "error" in response_data:
+    print(f"API Error: {response_data['error']}")
+    exit(1)
+
+if "choices" not in response_data:
+    print(f"Unexpected response format: {response_data}")
+    exit(1)
+
+summary = response_data["choices"][0]["message"]["content"]
 
 requests.post(
     DISCORD_WEBHOOK_URL,
