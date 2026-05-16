@@ -56,6 +56,34 @@ python briefing.py
 
 Do not commit `.env`. The real Discord webhook URL belongs only in `.env`, GitHub Actions secrets, or your hosting provider's secret manager.
 
+## Webhook output
+
+The briefing already uses a Discord embed rather than plain text. Each item is grouped into a single morning briefing to avoid channel spam.
+
+Example embed:
+
+```txt
+Title: Politisk morgenbrief - 2026-05-16
+Description: Toppsaker fra åpne RSS-kilder, valgt med regelbasert scoring.
+
+Field: Kort vurdering
+Mye av nyhetsbildet dreier seg om budsjett og økonomiske prioriteringer.
+
+Field: 1. Regjeringen legger frem nytt forslag
+Kilde: NRK
+Dato: 2026-05-16 08:03 CEST
+Tema: Styring/lovverk, Budsjett/økonomi
+Kort: Kort sammendrag fra RSS-metadata...
+Lenke: Åpne saken
+```
+
+Output safety:
+
+- The webhook URL is validated and never printed.
+- Article text is truncated before it is added to Discord fields.
+- The briefing is grouped into one embed with top stories, not one message per article.
+- Failed Discord responses log status and a short body for debugging.
+
 ## GitHub Actions
 
 The workflow runs automatically every day at `06:00 UTC` via GitHub Actions. That is normally `08:00` in Norway during summer time and `07:00` during winter time. It can also be triggered manually from the Actions tab.
